@@ -1,0 +1,817 @@
+import sys
+import os
+import re
+import pandas as pd
+import xlwings as xw
+import matplotlib
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.pyplot as plt
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QFileDialog, QHBoxLayout,
+    QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
+    QMessageBox, QDialog, QSizePolicy, QTabWidget
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QPalette, QFont
+
+# --------- 색상/폰트 설정 ---------
+BG_MAIN = "#121212"
+BG_CARD = "#1E1E1E"
+TEXT_MAIN = "#EAEAEA"
+TEXT_SUB = "#A0A0A0"
+BTN_BG = "#3B82F6"
+BTN_TEXT = "#FFFFFF"
+BTN_BG_SUB = "#2D2D2D"
+BTN_TEXT_SUB = "#EAEAEA"
+
+FONT_MAIN = QFont("맑은 고딕", 20)
+FONT_SUB = QFont("맑은 고딕", 20)
+FONT_TABLE_HEADER = QFont("맑은 고딕", 20)
+FONT_TABLE_CELL = QFont("맑은 고딕", 10)
+FONT_BTN = QFont("맑은 고딕", 20, QFont.Bold)
+FONT_SMALL = QFont("맑은 고딕", 20)
+FONT_BOLD = QFont("맑은 고딕", 20, QFont.Bold)
+
+SHEETS = [
+    "Basefile_US",
+    "Basefile_China",
+    "Basefile_Japan",
+    "Basefile_Europe",
+    "Basefile_India"
+]
+SHEET_TO_REGION = {
+    "Basefile_US": "US",
+    "Basefile_China": "China",
+    "Basefile_Japan": "Japan",
+    "Basefile_Europe": "Europe",
+    "Basefile_India": "India"
+}
+START_CELL = "B9"
+
+def extract_week_num(path):
+    match = re.search(r"Model_(\d+)Weeks\d{4}", os.path.basename(path))
+    return int(match.group(1)) if match else -1
+
+def read_sheet(path, sheet_name):
+    with xw.App(visible=False) as app:
+        wb = app.books.open(path)
+        sht = wb.sheets[sheet_name]
+        df_range = sht.range(START_CELL).expand('table')
+        data = df_range.options(pd.DataFrame, header=1, index=False).value
+        wb.close()
+    if sheet_name != "Basefile_Europe" and "Region" in data.columns:
+        data = data.drop(columns=["Region"])
+    return data
+
+def ensure_year_from_month(df):
+    if 'Year' not in df.columns and 'Month' in df.columns:
+        df['Year'] = pd.to_datetime(df['Month'], errors='coerce').dt.year
+    return df
+
+def calc_region_yoy(df, region, is_europe_we=False, years=[2023, 2024, 2025], max_week=None, prev_week=None):
+    df = ensure_year_from_month(df)
+    if 'Week' not in df.columns or 'Sales' not in df.columns or 'Year' not in df.columns:
+        return {y: {'cum': 0, 'w': {}} for y in years}
+    if is_europe_we:
+        if 'Region' not in df.columns:
+            return {y: {'cum': 0, 'w': {}} for y in years}
+        df = df[df['Region'] == 'W.Europe']
+    sales_by_year = {}
+    for y in years:
+        mask_cum = (df['Year'] == y) & (df['Week'] >= 1.0) & (df['Week'] <= max_week)
+        cum = df.loc[mask_cum, 'Sales'].sum() / 1_000_000
+        week_sales = {}
+        for w in range(1, max_week + 1):
+            mask_w = (df['Year'] == y) & (df['Week'] == w)
+            week_sales[w] = df.loc[mask_w, 'Sales'].sum() / 1_000_000
+        sales_by_year[y] = {'cum': cum, 'w': week_sales}
+    return sales_by_year
+
+def calc_vendor_yoy(df, region, is_europe_we=False, years=[2023, 2024, 2025], max_week=None, prev_week=None):
+    df = ensure_year_from_month(df)
+    if 'Week' not in df.columns or 'Sales' not in df.columns or 'Year' not in df.columns or 'Brand' not in df.columns:
+        return {}
+    if is_europe_we:
+        if 'Region' not in df.columns:
+            return {}
+        df = df[df['Region'] == 'W.Europe']
+    vendors = df['Brand'].dropna().unique()
+    vendor_dict = {}
+    for vendor in vendors:
+        dff = df[df['Brand'] == vendor]
+        vendor_dict[vendor] = calc_region_yoy(dff, region, is_europe_we=False, years=years, max_week=max_week, prev_week=prev_week)
+    return vendor_dict
+
+def get_region_week_trend(df, region, is_europe_we=False, years=[2023, 2024, 2025], max_week=None):
+    df = ensure_year_from_month(df)
+    if 'Week' not in df.columns or 'Sales' not in df.columns or 'Year' not in df.columns:
+        return {y: [] for y in years}
+    if is_europe_we:
+        if 'Region' not in df.columns:
+            return {y: [] for y in years}
+        df = df[df['Region'] == 'W.Europe']
+    trend = {}
+    for y in years:
+        sales_by_week = []
+        for w in range(1, max_week + 1):
+            mask = (df['Year'] == y) & (df['Week'] == w)
+            val = df.loc[mask, 'Sales'].sum() / 1_000_000
+            sales_by_week.append(val)
+        trend[y] = sales_by_week
+    return trend
+
+class TrendGraphDialog(QDialog):
+    def __init__(self, region, trend_dict, max_week, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{region} W1~W{max_week} 최근 3년 주차별 추이")
+        self.setMinimumWidth(680)
+        self.setMinimumHeight(460)
+        layout = QVBoxLayout()
+        fig, ax = plt.subplots(figsize=(7,4))
+        weeks = list(range(1, max_week+1))
+        colors = ['#10B981', '#3B82F6', '#F59E42']
+        for idx, year in enumerate(sorted(trend_dict.keys())):
+            ax.plot(weeks, trend_dict[year], label=f"{year}", marker='o', color=colors[idx % len(colors)])
+        ax.set_xlabel("Week")
+        ax.set_ylabel("Sales (100만/Mu)")
+        ax.set_title(f"{region} W1~W{max_week} Trend")
+        ax.legend()
+        ax.grid(True, linestyle="--", alpha=0.4)
+        fig.tight_layout()
+        canvas = FigureCanvas(fig)
+        layout.addWidget(canvas)
+        self.setLayout(layout)
+
+def format_month(val):
+    try:
+        return pd.to_datetime(val).strftime("%Y-%m")
+    except Exception:
+        return str(val)[:7]
+
+def monthly_sales_delta(df_old, df_new, region):
+    for df in [df_old, df_new]:
+        if 'Month' in df.columns:
+            df['Month'] = df['Month'].apply(format_month)
+    base_df = df_new if len(df_new) >= len(df_old) else df_old
+    if base_df.empty or 'Month' not in base_df.columns or 'Sales' not in base_df.columns:
+        return None
+    months = sorted(base_df['Month'].dropna().unique())
+    if len(months) == 0:
+        return None
+    latest_month = months[-1]
+    prev_month = months[-2] if len(months) > 1 else None
+
+    def get_sum(df, month):
+        if month is None:
+            return ""
+        filtered = df[df['Month'] == month]
+        return filtered['Sales'].sum() if not filtered.empty else 0
+
+    old_latest = get_sum(df_old, latest_month)
+    new_latest = get_sum(df_new, latest_month)
+    old_prev = get_sum(df_old, prev_month)
+    new_prev = get_sum(df_new, prev_month)
+
+    delta_latest = new_latest - old_latest if old_latest != "" and new_latest != "" else ""
+    delta_prev = new_prev - old_prev if old_prev != "" and new_prev != "" else ""
+
+    return {
+        "지역": region,
+        "최신월": latest_month,
+        "전달": prev_month if prev_month else "",
+        "delta_latest": int(delta_latest) if delta_latest != "" else "",
+        "delta_prev": int(delta_prev) if delta_prev != "" else ""
+    }
+
+def compare_df(df_old, df_new, key_cols, value_col):
+    merged = pd.merge(df_old, df_new, how='outer', on=key_cols, suffixes=('_old', '_new'), indicator=True)
+    removed = merged[merged['_merge'] == 'left_only']
+    changed = merged[
+        (merged['_merge'] == 'both') &
+        (
+            (merged[f'{value_col}_old'] != merged[f'{value_col}_new']) &
+            ~(merged[f'{value_col}_old'].isna() & merged[f'{value_col}_new'].isna())
+        )
+    ]
+    return removed, changed
+
+class CompareThread(QThread):
+    result_signal = pyqtSignal(pd.DataFrame, list)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, file_old, file_new, week_old, week_new):
+        super().__init__()
+        self.file_old = file_old
+        self.file_new = file_new
+        self.week_old = week_old
+        self.week_new = week_new
+
+    def run(self):
+        try:
+            compare_rows = []
+            monthly_details = []
+            for sheet in SHEETS:
+                region = SHEET_TO_REGION[sheet]
+                df_old = read_sheet(self.file_old, sheet)
+                df_new = read_sheet(self.file_new, sheet)
+                df_old = ensure_year_from_month(df_old)
+                df_new = ensure_year_from_month(df_new)
+
+                if sheet == "Basefile_Europe":
+                    key_cols = ["Region", "Brand", "Model", "Month", "Date", "Week"]
+                else:
+                    key_cols = ["Brand", "Model", "Month", "Date", "Week"]
+                value_col = "Sales"
+                df_old[value_col] = pd.to_numeric(df_old[value_col], errors='coerce')
+                df_new[value_col] = pd.to_numeric(df_new[value_col], errors='coerce')
+                removed, changed = compare_df(df_old, df_new, key_cols, value_col)
+                for _, row in removed.iterrows():
+                    compare_rows.append({
+                        "시트": sheet,
+                        **{col: row.get(col, "") for col in key_cols},
+                        "구분": "삭제",
+                        "Sales_old": row.get("Sales_old", ""),
+                        "Sales_new": ""
+                    })
+                for _, row in changed.iterrows():
+                    compare_rows.append({
+                        "시트": sheet,
+                        **{col: row.get(col, "") for col in key_cols},
+                        "구분": "변경",
+                        "Sales_old": row.get("Sales_old", ""),
+                        "Sales_new": row.get("Sales_new", "")
+                    })
+
+                details_row = monthly_sales_delta(df_old, df_new, region)
+                if details_row:
+                    monthly_details.append(details_row)
+            if compare_rows:
+                df = pd.DataFrame(compare_rows)
+                if 'Month' in df.columns:
+                    df['Month'] = df['Month'].apply(format_month)
+            else:
+                df = pd.DataFrame()
+            self.result_signal.emit(df, monthly_details)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("주간 엑셀 비교 툴")
+        self.setMinimumWidth(1900)
+        self.setStyleSheet(f"background-color: {BG_MAIN}; color: {TEXT_MAIN}; font-size: 20px;")
+
+        self.file_paths = [None, None]
+        self.week_nums = [None, None]
+        self.df_result = None
+        self.monthly_details = None
+        self.trend_data = {}
+        self.vendor_data = {}
+
+        self.file_labels = [QLabel("엑셀 파일 1: 없음"), QLabel("엑셀 파일 2: 없음")]
+        for label in self.file_labels:
+            label.setStyleSheet(f"color: {TEXT_SUB}; font-size:20px; font-weight:bold;")
+            label.setFont(FONT_MAIN)
+        self.file_btns = [QPushButton("파일 선택"), QPushButton("파일 선택")]
+        for btn in self.file_btns:
+            btn.setFont(FONT_BTN)
+            btn.setStyleSheet(f"""
+                background-color: {BTN_BG};
+                color: {BTN_TEXT};
+                border-radius: 8px;
+                min-width: 110px;
+                min-height: 38px;
+                font-size: 20px;
+            """)
+            btn.setCursor(Qt.PointingHandCursor)
+        self.file_btns[0].clicked.connect(lambda: self.select_file(0))
+        self.file_btns[1].clicked.connect(lambda: self.select_file(1))
+
+        self.drop_areas = [DropArea(0, self), DropArea(1, self)]
+
+        file_row1 = QHBoxLayout()
+        file_row1.addWidget(self.file_labels[0])
+        file_row1.addWidget(self.file_btns[0])
+        file_row2 = QHBoxLayout()
+        file_row2.addWidget(self.file_labels[1])
+        file_row2.addWidget(self.file_btns[1])
+
+        drag_row = QHBoxLayout()
+        drag_row.addWidget(self.drop_areas[0])
+        drag_row.addWidget(self.drop_areas[1])
+
+        self.compare_btn = QPushButton("엑셀 비교 실행")
+        self.compare_btn.setFont(FONT_BTN)
+        self.compare_btn.setStyleSheet(f"""
+            background-color: {BTN_BG};
+            color: {BTN_TEXT};
+            border-radius: 8px;
+            font-size: 20px;
+            font-weight: bold;
+            padding: 14px 28px;
+        """)
+        self.compare_btn.setCursor(Qt.PointingHandCursor)
+        self.compare_btn.clicked.connect(self.run_compare)
+
+        self.status_label = QLabel("")
+        self.status_label.setFont(FONT_BTN)
+        self.status_label.setStyleSheet(f"color:{BTN_BG}; font-size:20px; font-weight:bold;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+
+        # --- Tab UI ---
+        self.tabwidget = QTabWidget(self)
+        self.tabwidget.setStyleSheet("""
+            QTabBar::tab {
+                background: #3B82F6;
+                color: #FFFFFF;
+                font-size: 22px;
+                font-family: '맑은 고딕', Malgun Gothic, Arial, sans-serif;
+                height: 48px;
+                width: 160px;
+                margin: 4px;
+                border-radius: 0px;
+                padding: 8px 24px;
+                border-top: 2px solid #2563EB;
+                border-left: 1px solid #2563EB;
+                border-right: 1px solid #2563EB;
+            }
+            QTabBar::tab:selected {
+                background: #2563EB;
+                color: #FFFFFF;
+                font-weight: bold;
+                border-bottom: 2px solid #2563EB;
+            }
+            QTabBar::tab:hover {
+                background: #60A5FA;
+                color: #FFFFFF;
+            }
+            QTabWidget::pane {
+                border: none;
+                top:-2px;
+            }
+        """)
+
+        # Summary Tab
+        self.summary_tab = QWidget()
+        summary_layout = QVBoxLayout()
+        self.summary_label = QLabel('📊 <b>각 지역별 월별 판매량 증감</b>')
+        self.summary_label.setFont(FONT_BOLD)
+        self.summary_label.setStyleSheet(f"color:{TEXT_MAIN}; font-size:20px; font-weight:bold; margin-bottom:4px;")
+        self.summary_table = QTableWidget()
+        self.summary_table.setFont(FONT_TABLE_HEADER)
+        self.summary_table.setStyleSheet(f"background-color: {BG_CARD}; color: {TEXT_MAIN}; font-size: 20px;")
+        self.summary_table.horizontalHeader().setStyleSheet(f"background-color: {BG_CARD}; color: {BTN_BG}; font-weight: bold; font-size: 20px; font-family:'맑은 고딕', Malgun Gothic, Arial, sans-serif;")
+        self.summary_table.verticalHeader().setVisible(False)
+        self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.summary_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.summary_table.setFrameShape(QFrame.Box)
+        self.summary_table.setShowGrid(True)
+        self.summary_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.yoy_label = QLabel('📈 <b>지역별 누적 연간 판매량 (단위: 100만/Mu)</b>')
+        self.yoy_label.setFont(FONT_BOLD)
+        self.yoy_label.setStyleSheet(f"color:{TEXT_MAIN}; font-size:20px; font-weight:bold;")
+        self.yoy_table = QTableWidget()
+        self.yoy_table.setFont(FONT_TABLE_HEADER)
+        self.yoy_table.setStyleSheet(f"background-color: {BG_CARD}; color: {TEXT_MAIN}; font-size: 20px;")
+        self.yoy_table.horizontalHeader().setStyleSheet(f"background-color: {BG_CARD}; color: {BTN_BG}; font-weight: bold; font-size: 20px; font-family:'맑은 고딕', Malgun Gothic, Arial, sans-serif;")
+        self.yoy_table.verticalHeader().setVisible(False)
+        self.yoy_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.yoy_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.yoy_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.yoy_table.setFrameShape(QFrame.Box)
+        self.yoy_table.setShowGrid(True)
+        self.yoy_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.yoy_table.cellClicked.connect(self.on_yoy_table_cell_clicked)
+
+        self.guide_label = QLabel('✅ <b>비교 결과 (삭제/변경 데이터만 표시)</b>')
+        self.guide_label.setFont(FONT_BOLD)
+        self.guide_label.setStyleSheet(f"color:{TEXT_MAIN}; font-size:20px; font-weight:bold;")
+
+        self.result_table = QTableWidget()
+        self.result_table.setFont(FONT_TABLE_HEADER)
+        self.result_table.setStyleSheet(f"""
+            background-color: {BG_CARD};
+            color: {TEXT_MAIN};
+            gridline-color: {BTN_BG_SUB};
+            font-size: 20px;
+        """)
+        self.result_table.horizontalHeader().setStyleSheet(f"""
+            background-color: {BG_CARD};
+            color: {BTN_BG};
+            font-weight: bold;
+            font-size: 20px;
+            font-family:'맑은 고딕', Malgun Gothic, Arial, sans-serif;
+        """)
+        self.result_table.verticalHeader().setVisible(False)
+        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.result_table.setFrameShape(QFrame.Box)
+        self.result_table.setShowGrid(True)
+        self.result_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.download_btn = QPushButton("변경 내역 Excel로 다운로드")
+        self.download_btn.setFont(FONT_BTN)
+        self.download_btn.setStyleSheet(f"""
+            background-color: {BTN_BG_SUB};
+            color: {BTN_TEXT_SUB};
+            border-radius: 8px;
+            font-size: 20px;
+            font-weight: bold;
+            padding: 12px 24px;
+        """)
+        self.download_btn.setCursor(Qt.PointingHandCursor)
+        self.download_btn.clicked.connect(self.download_result)
+        self.download_btn.setEnabled(False)
+
+        summary_layout.addWidget(self.summary_label)
+        summary_layout.addWidget(self.summary_table)
+        summary_layout.addWidget(self.yoy_label)
+        summary_layout.addWidget(self.yoy_table)
+        summary_layout.addWidget(self.guide_label)
+        summary_layout.addWidget(self.result_table)
+        summary_layout.addWidget(self.download_btn, alignment=Qt.AlignRight)
+        self.summary_tab.setLayout(summary_layout)
+        self.tabwidget.addTab(self.summary_tab, "Summary")
+
+        # Vendor별 Tab 준비
+        self.vendor_tabs = {}
+        self.vendor_tables = {}
+        for region in ["US", "China", "Japan", "West Europe", "India"]:
+            tab = QWidget()
+            layout = QVBoxLayout()
+            table = QTableWidget()
+            table.setFont(FONT_TABLE_HEADER)
+            table.setStyleSheet("background-color:#1E1E1E; color:#EAEAEA; font-size:20px;")
+            table.horizontalHeader().setStyleSheet("background-color:#1E1E1E; color:#3B82F6; font-weight:bold; font-size:20px; font-family:'맑은 고딕', Malgun Gothic, Arial, sans-serif;")
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+            table.setSelectionMode(QTableWidget.SingleSelection)
+            table.setFrameShape(QFrame.Box)
+            table.setShowGrid(True)
+            table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            layout.addWidget(table)
+            tab.setLayout(layout)
+            self.tabwidget.addTab(tab, region)
+            self.vendor_tabs[region] = tab
+            self.vendor_tables[region] = table
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(file_row1)
+        main_layout.addLayout(file_row2)
+        main_layout.addSpacing(8)
+        main_layout.addLayout(drag_row)
+        main_layout.addSpacing(14)
+        main_layout.addWidget(self.compare_btn, alignment=Qt.AlignCenter)
+        main_layout.addSpacing(18)
+        main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.tabwidget)
+        main_layout.setContentsMargins(28, 28, 28, 28)
+        self.setLayout(main_layout)
+
+    def set_file_path(self, idx, path):
+        self.file_paths[idx] = path
+        self.file_labels[idx].setText(f"엑셀 파일 {idx+1}: {os.path.basename(path)}")
+
+    def select_file(self, idx):
+        file_path, _ = QFileDialog.getOpenFileName(self, "엑셀 파일 선택", "", "Excel Files (*.xlsx)")
+        if file_path:
+            self.set_file_path(idx, file_path)
+            self.drop_areas[idx].setText(os.path.basename(file_path))
+            self.drop_areas[idx].file_path = file_path
+            self.drop_areas[idx].setStyleSheet(f"""
+                background-color: {BG_CARD};
+                color: {BTN_BG};
+                border: 2px solid {BTN_BG};
+                border-radius: 12px;
+                min-height: 54px;
+                font-size: 20px;
+                padding: 18px;
+            """)
+
+    def get_new_old_files(self):
+        if not self.file_paths[0] or not self.file_paths[1]:
+            return None, None, None, None
+        w0 = extract_week_num(self.file_paths[0])
+        w1 = extract_week_num(self.file_paths[1])
+        if w0 == -1 or w1 == -1:
+            return self.file_paths[0], self.file_paths[1], w0, w1
+        if w0 < w1:
+            return self.file_paths[0], self.file_paths[1], w0, w1
+        else:
+            return self.file_paths[1], self.file_paths[0], w1, w0
+
+    def run_compare(self):
+        files = self.get_new_old_files()
+        if not files or not files[0] or not files[1]:
+            QMessageBox.warning(self, "경고", "두 개의 엑셀 파일을 모두 선택/드래그하세요.")
+            return
+        file_old, file_new, week_old, week_new = files
+        self.week_nums = [week_old, week_new]
+        self.status_label.setText("🔄 비교 실행중... (엑셀 파일을 읽고 있습니다)")
+        self.status_label.repaint()
+        self.compare_btn.setEnabled(False)
+        self.download_btn.setEnabled(False)
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(1)
+        self.result_table.setHorizontalHeaderLabels(["로딩중..."])
+        self.summary_table.clear()
+        self.summary_table.setRowCount(0)
+        self.summary_table.setColumnCount(1)
+        self.summary_table.setHorizontalHeaderLabels(["로딩중..."])
+        self.yoy_table.clear()
+        self.yoy_table.setRowCount(0)
+        self.yoy_table.setColumnCount(1)
+        self.yoy_table.setHorizontalHeaderLabels(["로딩중..."])
+        for table in self.vendor_tables.values():
+            table.clear()
+            table.setRowCount(0)
+            table.setColumnCount(1)
+            table.setHorizontalHeaderLabels(["로딩중..."])
+        self.trend_data = {}
+        self.vendor_data = {}
+        self.thread = CompareThread(file_old, file_new, week_old, week_new)
+        self.thread.result_signal.connect(self.on_compare_result)
+        self.thread.error_signal.connect(self.on_compare_error)
+        self.thread.start()
+
+    def on_compare_result(self, df, monthly_details):
+        self.compare_btn.setEnabled(True)
+        self.status_label.clear()
+        self.df_result = df
+        self.monthly_details = monthly_details
+        self.show_summary_table(monthly_details)
+        if self.file_paths[0] and self.file_paths[1]:
+            w0 = extract_week_num(self.file_paths[0])
+            w1 = extract_week_num(self.file_paths[1])
+            file_new = self.file_paths[1] if w1 > w0 else self.file_paths[0]
+            match = re.search(r"Model_(\d+)Weeks\d{4}", os.path.basename(file_new))
+            max_week = int(match.group(1)) if match else None
+            prev_week = max_week - 1 if max_week and max_week > 1 else None
+            yoy_dict = {}
+            trend_dict = {}
+            vendor_data = {}
+            for region in ["US", "China", "Japan", "West Europe", "India"]:
+                is_europe_we = (region == "West Europe")
+                sheet = "Basefile_Europe" if is_europe_we else f"Basefile_{region}"
+                dfnew = read_sheet(file_new, sheet)
+                if is_europe_we:
+                    yoy = calc_region_yoy(dfnew, region, is_europe_we=True, max_week=max_week, prev_week=prev_week)
+                    trend = get_region_week_trend(dfnew, region, is_europe_we=True, max_week=max_week)
+                    vendor_yoy = calc_vendor_yoy(dfnew, region, is_europe_we=True, max_week=max_week, prev_week=prev_week)
+                else:
+                    yoy = calc_region_yoy(dfnew, region, is_europe_we=False, max_week=max_week, prev_week=prev_week)
+                    trend = get_region_week_trend(dfnew, region, is_europe_we=False, max_week=max_week)
+                    vendor_yoy = calc_vendor_yoy(dfnew, region, is_europe_we=False, max_week=max_week, prev_week=prev_week)
+                yoy_dict[region] = yoy
+                trend_dict[region] = trend
+                vendor_data[region] = vendor_yoy
+            self.trend_data = trend_dict
+            self.vendor_data = vendor_data
+            self.show_sum_yoy_table(yoy_dict, self.yoy_table, self.yoy_label, max_week, prev_week)
+            for region in ["US", "China", "Japan", "West Europe", "India"]:
+                self.show_vendor_yoy_table(vendor_data[region], self.vendor_tables[region], max_week, prev_week)
+        if not df.empty:
+            self.show_result_table(df)
+            self.download_btn.setEnabled(True)
+        else:
+            self.result_table.clear()
+            self.result_table.setRowCount(0)
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["변화된 데이터가 없습니다."])
+            self.download_btn.setEnabled(False)
+
+    def on_compare_error(self, msg):
+        self.compare_btn.setEnabled(True)
+        self.status_label.setText("❌ 에러 발생")
+        QMessageBox.critical(self, "오류", f"비교 중 오류 발생: {msg}")
+
+    def show_result_table(self, df):
+        self.result_table.clear()
+        self.result_table.setRowCount(len(df))
+        self.result_table.setColumnCount(len(df.columns))
+        self.result_table.setHorizontalHeaderLabels(list(df.columns))
+        for i, (_, row) in enumerate(df.iterrows()):
+            for j, val in enumerate(row):
+                item = QTableWidgetItem(str(val))
+                if row["구분"] == "삭제":
+                    item.setForeground(QColor("#F87171"))
+                elif row["구분"] == "변경":
+                    item.setForeground(QColor("#FBBF24"))
+                item.setFont(FONT_TABLE_CELL)
+                self.result_table.setItem(i, j, item)
+        self.result_table.resizeColumnsToContents()
+        self.result_table.horizontalHeader().setFont(FONT_TABLE_HEADER)
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+
+    # 월별 증감: 전달(Mu)만
+    def show_summary_table(self, details_list):
+        self.summary_table.clear()
+        cols = ["지역", "전달", "delta_prev"]
+        col_headers = ["지역", "전달", "전달 증감(Mu)"]
+        self.summary_table.setRowCount(len(details_list))
+        self.summary_table.setColumnCount(len(cols))
+        self.summary_table.setHorizontalHeaderLabels(col_headers)
+        for i, row in enumerate(details_list):
+            item_region = QTableWidgetItem(str(row.get("지역", "")))
+            item_month = QTableWidgetItem(str(row.get("전달", "")))
+            delta = row.get("delta_prev", 0)
+            delta_mu = float(delta) / 1_000_000 if delta not in ("", None) else 0
+            item_delta = QTableWidgetItem(f"{delta_mu:+.2f}Mu")
+            if delta_mu > 0:
+                item_delta.setForeground(QColor("#3B82F6"))
+            elif delta_mu < 0:
+                item_delta.setForeground(QColor("#F87171"))
+            item_region.setFont(FONT_TABLE_CELL)
+            item_month.setFont(FONT_TABLE_CELL)
+            item_delta.setFont(FONT_TABLE_CELL)
+            self.summary_table.setItem(i, 0, item_region)
+            self.summary_table.setItem(i, 1, item_month)
+            self.summary_table.setItem(i, 2, item_delta)
+        self.summary_table.resizeColumnsToContents()
+        self.summary_table.horizontalHeader().setFont(FONT_TABLE_HEADER)
+        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        height = self.summary_table.horizontalHeader().height() + sum([self.summary_table.rowHeight(i) for i in range(self.summary_table.rowCount())]) + 8
+        self.summary_table.setFixedHeight(height)
+
+    # 지역별 W1~W34 Sales: YoY(%) (Mu) 형태
+    def show_sum_yoy_table(self, yoy_dict, table_widget, table_label, max_week, prev_week):
+        table_widget.clear()
+        week_title = f"W1~W{max_week} Sales (단위: 100만/Mu)"
+        table_label.setText(f"📈 <b>지역별 {week_title}</b>")
+        regions = ["US", "China", "Japan", "India", "West Europe"]
+        cols = [
+            "지역",
+            f"W1~W{max_week}(2023)", f"W1~W{max_week}(2024)", f"W1~W{max_week}(2025)",
+            f"W{max_week} YoY(%) (Mu)", f"W{max_week} WoW(%) (Mu)"
+        ]
+        table_widget.setRowCount(len(regions))
+        table_widget.setColumnCount(len(cols))
+        table_widget.setHorizontalHeaderLabels(cols)
+        for i, region in enumerate(regions):
+            vals = yoy_dict.get(region, {2023: {'cum': 0, 'w': {}}, 2024: {'cum': 0, 'w': {}}, 2025: {'cum': 0, 'w': {}}})
+            c23 = vals[2023]['cum']
+            c24 = vals[2024]['cum']
+            c25 = vals[2025]['cum']
+            yoy_mu = c25 - c24
+            yoy_percent = int((c25-c24)/c24*100) if c24 != 0 else 0
+            w34 = vals[2025]['w'].get(max_week, 0)
+            w33 = vals[2025]['w'].get(prev_week, 0)
+            wow_mu = w34 - w33
+            wow_percent = int(((w34 - w33)/w33)*100) if w33 != 0 else 0
+            yoy_text = f"{yoy_percent:+d}% ({yoy_mu:+.2f}Mu)"
+            wow_text = f"{wow_percent:+d}% ({wow_mu:+.2f}Mu)"
+            row_data = [
+                region,
+                f"{c23:.2f}", f"{c24:.2f}", f"{c25:.2f}",
+                yoy_text,
+                wow_text,
+            ]
+            for j, val in enumerate(row_data):
+                item = QTableWidgetItem(val)
+                if cols[j] in [f"W{max_week} YoY(%) (Mu)", f"W{max_week} WoW(%) (Mu)"]:
+                    if val.startswith("+") or val.startswith("0") or ("+0" in val):
+                        item.setForeground(QColor("#3B82F6"))
+                    elif "-" in val:
+                        item.setForeground(QColor("#F87171"))
+                item.setFont(FONT_TABLE_CELL)
+                table_widget.setItem(i, j, item)
+        table_widget.resizeColumnsToContents()
+        table_widget.horizontalHeader().setFont(FONT_TABLE_HEADER)
+        table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        height = table_widget.horizontalHeader().height() + sum([table_widget.rowHeight(i) for i in range(table_widget.rowCount())]) + 8
+        table_widget.setFixedHeight(height)
+
+    # Vendor별 표도 동일하게 YoY(%) (Mu) 형태로
+    def show_vendor_yoy_table(self, vendor_yoy_dict, table_widget, max_week, prev_week):
+        brands = sorted(vendor_yoy_dict.keys())
+        cols = [
+            "Brand",
+            f"W1~W{max_week}(2023)", f"W1~W{max_week}(2024)", f"W1~W{max_week}(2025)",
+            f"W{max_week} YoY(%) (Mu)", f"W{max_week} WoW(%) (Mu)"
+        ]
+        table_widget.clear()
+        table_widget.setRowCount(len(brands))
+        table_widget.setColumnCount(len(cols))
+        table_widget.setHorizontalHeaderLabels(cols)
+        for i, brand in enumerate(brands):
+            vals = vendor_yoy_dict[brand]
+            c23 = vals[2023]['cum']
+            c24 = vals[2024]['cum']
+            c25 = vals[2025]['cum']
+            yoy_mu = c25 - c24
+            yoy_percent = int((c25-c24)/c24*100) if c24 != 0 else 0
+            w34 = vals[2025]['w'].get(max_week, 0)
+            w33 = vals[2025]['w'].get(prev_week, 0)
+            wow_mu = w34 - w33
+            wow_percent = int(((w34-w33)/w33)*100) if w33 != 0 else 0
+            yoy_text = f"{yoy_percent:+d}% ({yoy_mu:+.2f}Mu)"
+            wow_text = f"{wow_percent:+d}% ({wow_mu:+.2f}Mu)"
+            row_data = [
+                brand,
+                f"{c23:.2f}", f"{c24:.2f}", f"{c25:.2f}",
+                yoy_text,
+                wow_text,
+            ]
+            for j, val in enumerate(row_data):
+                item = QTableWidgetItem(val)
+                if cols[j] in [f"W{max_week} YoY(%) (Mu)", f"W{max_week} WoW(%) (Mu)"]:
+                    if val.startswith("+") or val.startswith("0") or ("+0" in val):
+                        item.setForeground(QColor("#3B82F6"))
+                    elif "-" in val:
+                        item.setForeground(QColor("#F87171"))
+                item.setFont(FONT_TABLE_CELL)
+                table_widget.setItem(i, j, item)
+        table_widget.resizeColumnsToContents()
+        table_widget.horizontalHeader().setFont(FONT_TABLE_HEADER)
+        table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        height = table_widget.horizontalHeader().height() + sum([table_widget.rowHeight(i) for i in range(table_widget.rowCount())]) + 8
+        table_widget.setFixedHeight(height)
+
+    def on_yoy_table_cell_clicked(self, row, col):
+        if col != 0:
+            return
+        region = self.yoy_table.item(row, 0).text()
+        if region not in self.trend_data:
+            QMessageBox.warning(self, "경고", "트렌드 데이터가 없습니다.")
+            return
+        max_week = self.yoy_table.horizontalHeaderItem(1).text()
+        max_week = int(re.search(r"W1~W(\d+)", max_week).group(1)) if max_week else 34
+        trend = self.trend_data[region]
+        dlg = TrendGraphDialog(region, trend, max_week, self)
+        dlg.exec_()
+
+    def download_result(self):
+        if self.df_result is None or self.df_result.empty:
+            QMessageBox.information(self, "안내", "다운로드할 데이터가 없습니다.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, "변경 내역 Excel 저장", "비교결과.xlsx", "Excel Files (*.xlsx)")
+        if file_path:
+            if not file_path.lower().endswith(".xlsx"):
+                file_path += ".xlsx"
+            try:
+                self.df_result.to_excel(file_path, index=False)
+                QMessageBox.information(self, "다운로드 완료", f"엑셀로 저장하였습니다:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "오류", f"저장 실패: {e}")
+
+class DropArea(QLabel):
+    def __init__(self, index, parent=None):
+        super().__init__(parent)
+        self.index = index
+        self.setText(f"여기로 파일({index+1})을 Drag & Drop 하세요")
+        self.setFont(FONT_SUB)
+        self.setStyleSheet(f"""
+            background-color: {BG_CARD};
+            color: {TEXT_SUB};
+            border: 2px dashed {BTN_BG};
+            border-radius: 12px;
+            min-height: 54px;
+            font-size: 20px;
+            padding: 18px;
+        """)
+        self.setAlignment(Qt.AlignCenter)
+        self.setAcceptDrops(True)
+        self.file_path = None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if path.lower().endswith(".xlsx"):
+                self.file_path = path
+                self.setText(os.path.basename(path))
+                self.setStyleSheet(f"""
+                    background-color: {BG_CARD};
+                    color: {BTN_BG};
+                    border: 2px solid {BTN_BG};
+                    border-radius: 12px;
+                    min-height: 54px;
+                    font-size: 20px;
+                    padding: 18px;
+                """)
+                self.parent().set_file_path(self.index, path)
+            else:
+                QMessageBox.warning(self, "경고", "엑셀(xlsx) 파일만 지원합니다.")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(BG_MAIN))
+    palette.setColor(QPalette.Base, QColor(BG_CARD))
+    palette.setColor(QPalette.Text, QColor(TEXT_MAIN))
+    app.setPalette(palette)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
