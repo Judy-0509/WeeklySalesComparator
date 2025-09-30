@@ -29,3 +29,6 @@ It highlights data changes, computes **YoY (Year-over-Year)** and **WoW (Week-ov
 Install dependencies:  
 ```bash
 pip install pandas xlwings matplotlib PyQt5
+
+
+<img width="671" height="307" alt="image" src="https://github.com/user-attachments/assets/7830b951-9623-4c9c-99bd-14680a19bf82" />
